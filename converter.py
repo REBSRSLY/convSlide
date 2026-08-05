@@ -10,22 +10,52 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches
+from docx.shared import Inches, RGBColor
 
-BULLET_PREFIXES = ("•", "‣", "▪", "◦", "●", "○", "-", "*")
+BULLET_PREFIXES = ("•", "‣", "▪", "◦", "●", "○", "-", "*", "­", "‐")
 NUMBERED_RE = re.compile(r"^(\d+[.)]|[a-zA-Z][.)])\s+(.*)")
+
+RIGHT_ARROW_CHARS = "→⇒➔➜➞➡⮕⟶⇾⤀"
+LEFT_ARROW_CHARS = "←⇐⬅⟵⇽"
+
+BLOCKLIST_KEYWORDS = ("politecnico", "motor system rehabilitation")
+ACADEMIC_YEAR_RE = re.compile(r"\b\d{4}\s*/\s*\d{4}\b")
 
 MIN_IMAGE_DIM = 40  # px; skip tiny icons
 EDGE_BAND_RATIO = 0.08  # top/bottom 8% of the slide = header/footer band
-SMALL_FONT_FACTOR = 0.65  # relative to median body font size
+SMALL_FONT_FACTOR = 0.65  # relative to median body font size, for footer detection
+H2_FONT_FACTOR = 1.35  # relative to median body font size, for sub-heading detection
+H3_FONT_FACTOR = 1.15
+
 LARGE_IMAGE_AREA_RATIO = 0.12  # image covers >=12% of the slide -> treated as a chart/graphic
 LARGE_IMAGE_WIDTH_IN = 6.0
+LARGE_IMAGE_MAX_HEIGHT_IN = 3.0
 SMALL_IMAGE_WIDTH_IN = 2.0
-TITLE_SHADE_COLOR = "B8CCE4"
-HEADING_SHADE_COLOR = "D9E2F3"
+SMALL_IMAGE_MAX_HEIGHT_IN = 1.5
+
+DOCUMENT_FONT = "Aptos"
 NARROW_MARGIN_IN = 0.5
 
+# Approximation of Word's built-in "Shaded" design (Design tab > Style Set):
+# solid color blocks for the top-level headings, fading to plain colored text
+# for the deeper levels.
+TITLE_SHADE_FILL = "1F4E79"
+TITLE_FONT_COLOR = "FFFFFF"
+H1_SHADE_FILL = "2E74B5"
+H1_FONT_COLOR = "FFFFFF"
+H2_SHADE_FILL = "DEEAF6"
+H2_FONT_COLOR = "1F4E79"
+H3_FONT_COLOR = "2E74B5"
+
 STYLE_FOR_KIND = {"bullet": "List Bullet", "number": "List Number"}
+
+
+def _convert_arrows(text):
+    for ch in RIGHT_ARROW_CHARS:
+        text = text.replace(ch, "-->")
+    for ch in LEFT_ARROW_CHARS:
+        text = text.replace(ch, "<--")
+    return text
 
 
 def _line_kind(text):
@@ -53,12 +83,50 @@ def _looks_like_page_number(lines):
     return len(lines) == 1 and lines[0].strip().isdigit() and len(lines[0].strip()) <= 3
 
 
+def _looks_like_institutional_noise(lines):
+    joined = " ".join(lines).lower()
+    if any(keyword in joined for keyword in BLOCKLIST_KEYWORDS):
+        return True
+    return bool(ACADEMIC_YEAR_RE.search(joined))
+
+
 def _normalize(text):
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
 def _block_key(block):
     return _normalize(" ".join(block["lines"]))
+
+
+def _set_run_font(run, name=DOCUMENT_FONT):
+    run.font.name = name
+    rPr = run._r.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        rFonts.set(qn(attr), name)
+
+
+def _set_style_font(document, style_name, name=DOCUMENT_FONT):
+    try:
+        style = document.styles[style_name]
+    except KeyError:
+        return
+    style.font.name = name
+    rPr = style.element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        rFonts.set(qn(attr), name)
+
+
+def _apply_document_font(document):
+    for style_name in ("Normal", "Title", "Heading 1", "Heading 2", "Heading 3", "List Bullet", "List Number"):
+        _set_style_font(document, style_name)
 
 
 def _shade_paragraph(paragraph, hex_color):
@@ -68,6 +136,14 @@ def _shade_paragraph(paragraph, hex_color):
     shd.set(qn("w:color"), "auto")
     shd.set(qn("w:fill"), hex_color)
     pPr.append(shd)
+
+
+def _style_heading(paragraph, fill_hex=None, font_hex=None):
+    if fill_hex:
+        _shade_paragraph(paragraph, fill_hex)
+    if font_hex:
+        for run in paragraph.runs:
+            run.font.color.rgb = RGBColor.from_string(font_hex)
 
 
 def _set_narrow_margins(document):
@@ -87,6 +163,7 @@ def _add_centered_page_number_footer(document):
         paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
         run = paragraph.add_run()
+        _set_run_font(run)
         fld_begin = OxmlElement("w:fldChar")
         fld_begin.set(qn("w:fldCharType"), "begin")
         instr_text = OxmlElement("w:instrText")
@@ -108,12 +185,12 @@ def _extract_page_blocks(page):
         lines, sizes = [], []
         for line in b.get("lines", []):
             spans = line.get("spans", [])
-            line_text = "".join(s.get("text", "") for s in spans).strip()
+            line_text = _convert_arrows("".join(s.get("text", "") for s in spans).strip())
             if not line_text:
                 continue
             sizes.extend(s.get("size", 0) for s in spans)
             lines.append(line_text)
-        if not lines or _looks_like_page_number(lines):
+        if not lines or _looks_like_page_number(lines) or _looks_like_institutional_noise(lines):
             continue
         blocks.append({
             "bbox": b["bbox"],
@@ -180,7 +257,7 @@ def _collect_document_data(src):
                 digest_freq[info["digest"]] += 1
 
     median_size = statistics.median(all_sizes) if all_sizes else 12
-    return pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size * SMALL_FONT_FACTOR
+    return pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size
 
 
 def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq):
@@ -205,11 +282,12 @@ def _filter_images(images, page_height, page_area, xref_freq, digest_freq):
         if info.get("width", 0) < MIN_IMAGE_DIM or info.get("height", 0) < MIN_IMAGE_DIM:
             continue
         bbox = info["bbox"]
-        in_edge_band = (
-            bbox[1] < page_height * EDGE_BAND_RATIO
-            or bbox[3] > page_height * (1 - EDGE_BAND_RATIO)
-        )
-        if in_edge_band:
+        # Only treat as a corner logo/watermark if it sits ENTIRELY within the
+        # top/bottom margin band; a large chart merely extending past that
+        # line (but mostly in the body) must survive.
+        fully_in_top_band = bbox[3] <= page_height * EDGE_BAND_RATIO
+        fully_in_bottom_band = bbox[1] >= page_height * (1 - EDGE_BAND_RATIO)
+        if fully_in_top_band or fully_in_bottom_band:
             continue
         if info.get("xref") and xref_freq[info["xref"]] >= 2:
             continue
@@ -231,18 +309,47 @@ def _detect_title(blocks, page_height):
     return None, blocks
 
 
+def _classify_subheading(block, median_size):
+    """A short, single-line block that is noticeably larger than normal body
+    text (but isn't the slide title) is treated as a Heading 2/3."""
+    if len(block["lines"]) != 1 or _line_kind(block["lines"][0]):
+        return None
+    if block["avg_size"] >= median_size * H2_FONT_FACTOR:
+        return "Heading 2"
+    if block["avg_size"] >= median_size * H3_FONT_FACTOR:
+        return "Heading 3"
+    return None
+
+
+def _add_sized_picture(document, png_bytes, target_width_in, max_height_in):
+    width_kwargs = {"width": Inches(target_width_in)}
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            px_w, px_h = im.size
+        if px_w and px_h:
+            projected_height_in = target_width_in * (px_h / px_w)
+            if projected_height_in > max_height_in:
+                width_kwargs = {"height": Inches(max_height_in)}
+    except Exception:
+        pass
+    document.add_picture(io.BytesIO(png_bytes), **width_kwargs)
+    document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+
 def pdf_to_docx(pdf_bytes, title="Presentazione"):
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_blocks, pages_images, text_freq, xref_freq, digest_freq, small_font_threshold = (
+    pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size = (
         _collect_document_data(src)
     )
+    small_font_threshold = median_size * SMALL_FONT_FACTOR
 
     document = Document()
+    _apply_document_font(document)
     _set_narrow_margins(document)
     _add_centered_page_number_footer(document)
 
     title_paragraph = document.add_heading(title, level=0)
-    _shade_paragraph(title_paragraph, TITLE_SHADE_COLOR)
+    _style_heading(title_paragraph, TITLE_SHADE_FILL, TITLE_FONT_COLOR)
 
     prev_title_norm = None
     seen_in_section = set()
@@ -259,18 +366,33 @@ def pdf_to_docx(pdf_bytes, title="Presentazione"):
 
         if title_norm and title_norm != prev_title_norm:
             heading_paragraph = document.add_heading(slide_title, level=1)
-            _shade_paragraph(heading_paragraph, HEADING_SHADE_COLOR)
+            _style_heading(heading_paragraph, H1_SHADE_FILL, H1_FONT_COLOR)
             prev_title_norm = title_norm
             seen_in_section = set()
 
         for b in body_blocks:
+            subheading_style = _classify_subheading(b, median_size)
+            if subheading_style:
+                text = _normalize(b["lines"][0])
+                if text in seen_in_section:
+                    continue
+                seen_in_section.add(text)
+                heading_paragraph = document.add_heading(b["lines"][0], level=int(subheading_style[-1]))
+                if subheading_style == "Heading 2":
+                    _style_heading(heading_paragraph, H2_SHADE_FILL, H2_FONT_COLOR)
+                else:
+                    _style_heading(heading_paragraph, None, H3_FONT_COLOR)
+                continue
+
             for text, kind in _paragraphs_from_block(b):
                 norm = _normalize(text)
                 if norm in seen_in_section:
                     continue
                 seen_in_section.add(norm)
                 style = STYLE_FOR_KIND.get(kind)
-                document.add_paragraph(text, style=style)
+                paragraph = document.add_paragraph(text, style=style)
+                for run in paragraph.runs:
+                    _set_run_font(run)
 
         for info in images:
             try:
@@ -282,10 +404,12 @@ def pdf_to_docx(pdf_bytes, title="Presentazione"):
                 continue
             bbox = info["bbox"]
             area_ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / page_area
-            target_width = LARGE_IMAGE_WIDTH_IN if area_ratio >= LARGE_IMAGE_AREA_RATIO else SMALL_IMAGE_WIDTH_IN
+            if area_ratio >= LARGE_IMAGE_AREA_RATIO:
+                target_width, max_height = LARGE_IMAGE_WIDTH_IN, LARGE_IMAGE_MAX_HEIGHT_IN
+            else:
+                target_width, max_height = SMALL_IMAGE_WIDTH_IN, SMALL_IMAGE_MAX_HEIGHT_IN
             try:
-                document.add_picture(io.BytesIO(png_bytes), width=Inches(target_width))
-                document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _add_sized_picture(document, png_bytes, target_width, max_height)
             except Exception:
                 continue
 
