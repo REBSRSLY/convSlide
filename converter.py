@@ -52,28 +52,32 @@ H3_FONT_COLOR = "2E74B5"
 STYLE_FOR_KIND = {"bullet": "List Bullet", "number": "List Number"}
 
 
+RIGHT_ARROW_TEXT = "➞"
+LEFT_ARROW_TEXT = "<--"
+
+
+def _arrow_replacement(ch):
+    """If ch is an arrow glyph (a named Unicode arrow, or an unmapped
+    symbol-font Private Use Area glyph such as the Wingdings arrow
+    PowerPoint uses for "leads to" bullets), return its text replacement;
+    otherwise return None."""
+    cp = ord(ch)
+    try:
+        name = unicodedata.name(ch)
+    except ValueError:
+        name = None
+    if name and "ARROW" in name:
+        is_left = "LEFT" in name and "RIGHT" not in name
+        return LEFT_ARROW_TEXT if is_left else RIGHT_ARROW_TEXT
+    if 0xE000 <= cp <= 0xF8FF:
+        return RIGHT_ARROW_TEXT
+    return None
+
+
 def _convert_arrows(text):
     """Replace any Unicode arrow glyph (any direction, any arrow block) with
-    an ASCII arrow so it survives into plain Word text."""
-    out = []
-    for ch in text:
-        cp = ord(ch)
-        try:
-            name = unicodedata.name(ch)
-        except ValueError:
-            name = None
-        if name and "ARROW" in name:
-            is_left = "LEFT" in name and "RIGHT" not in name
-            out.append("<--" if is_left else "-->")
-        elif 0xE000 <= cp <= 0xF8FF:
-            # Private-use-area glyph from a symbol font (Wingdings/Webdings)
-            # left unmapped by the PDF -- in slide decks these are almost
-            # always the arrow glyph used in "leads to" bullet phrasing, and
-            # otherwise they'd just render as a "?" box in Word.
-            out.append("-->")
-        else:
-            out.append(ch)
-    return "".join(out)
+    an ASCII/plain-text arrow so it survives into Word text."""
+    return "".join(_arrow_replacement(ch) or ch for ch in text)
 
 
 def _sanitize_text(text):
@@ -83,25 +87,23 @@ def _sanitize_text(text):
     return CONTROL_CHAR_RE.sub("", text)
 
 
-def _line_kind(text):
-    stripped = text.strip()
+def _classify_line_marker(raw_text):
+    """Look at a RAW (not yet arrow-converted) line and split off a leading
+    list marker. Returns (kind, remainder) where remainder still needs
+    _convert_arrows applied. A leading arrow glyph counts as a bullet too --
+    some slide templates use an arrow instead of a dot as the bullet mark --
+    so it's consumed as the marker instead of becoming inline "➞" text."""
+    stripped = raw_text.strip()
     if not stripped:
-        return None
+        return None, stripped
     if stripped[0] in BULLET_PREFIXES:
-        return "bullet"
-    if NUMBERED_RE.match(stripped):
-        return "number"
-    return None
-
-
-def _strip_marker(text):
-    stripped = text.strip()
-    if stripped and stripped[0] in BULLET_PREFIXES:
-        return stripped[1:].strip()
+        return "bullet", stripped[1:].strip()
     m = NUMBERED_RE.match(stripped)
     if m:
-        return m.group(2)
-    return stripped
+        return "number", m.group(2)
+    if _arrow_replacement(stripped[0]) is not None:
+        return "bullet", stripped[1:].strip()
+    return None, stripped
 
 
 def _looks_like_page_number(lines):
@@ -125,7 +127,7 @@ def _normalize(text):
 
 
 def _block_key(block):
-    return _normalize(" ".join(block["lines"]))
+    return _normalize(" ".join(text for text, _kind in block["lines"]))
 
 
 def _set_run_font(run, name=DOCUMENT_FONT):
@@ -215,12 +217,14 @@ def _extract_page_blocks(page):
         lines, sizes = [], []
         for line in b.get("lines", []):
             spans = line.get("spans", [])
-            line_text = _sanitize_text(_convert_arrows("".join(s.get("text", "") for s in spans).strip()))
-            if not line_text:
+            raw_text = _sanitize_text("".join(s.get("text", "") for s in spans).strip())
+            if not raw_text:
                 continue
             sizes.extend(s.get("size", 0) for s in spans)
-            lines.append(line_text)
-        if not lines or _looks_like_page_number(lines) or _looks_like_institutional_noise(lines):
+            kind, remainder = _classify_line_marker(raw_text)
+            lines.append((_convert_arrows(remainder), kind))
+        plain_lines = [text for text, _kind in lines]
+        if not lines or _looks_like_page_number(plain_lines) or _looks_like_institutional_noise(plain_lines):
             continue
         blocks.append({
             "bbox": b["bbox"],
@@ -235,16 +239,15 @@ def _paragraphs_from_block(block):
     """Merge wrapped lines into paragraphs, splitting on new bullet/number markers."""
     paragraphs = []
     current_text, current_kind = None, None
-    for line in block["lines"]:
-        kind = _line_kind(line)
+    for text, kind in block["lines"]:
         if kind:
             if current_text:
                 paragraphs.append((current_text, current_kind))
-            current_text, current_kind = _strip_marker(line), kind
+            current_text, current_kind = text, kind
         elif current_text is None:
-            current_text, current_kind = line, None
+            current_text, current_kind = text, None
         else:
-            current_text += " " + line
+            current_text += " " + text
     if current_text:
         paragraphs.append((current_text, current_kind))
     return paragraphs
@@ -338,7 +341,7 @@ def _detect_title(blocks, page_height):
     max_size = max(b["avg_size"] for b in blocks)
     for b in blocks:
         if b["avg_size"] == max_size and b["bbox"][1] < page_height * 0.35:
-            title = " ".join(b["lines"])
+            title = " ".join(text for text, _kind in b["lines"])
             body_blocks = [x for x in blocks if x is not b]
             return title, body_blocks
     return None, blocks
@@ -348,16 +351,16 @@ def _looks_like_cover_slide_label(block):
     """Short, non-list fragments like 'Lesson', 'of', a lecture topic, or a
     professor's name, typically laid out as separate boxes on a title
     slide rather than real sentences."""
-    if _line_kind(block["lines"][0]):
+    if block["lines"][0][1]:  # starts with a bullet/number marker
         return False
-    word_count = sum(len(line.split()) for line in block["lines"])
+    word_count = sum(len(text.split()) for text, _kind in block["lines"])
     return len(block["lines"]) <= 2 and word_count <= 4
 
 
 def _classify_subheading(block, median_size):
     """A short, single-line block that is noticeably larger than normal body
     text (but isn't the slide title) is treated as a Heading 2/3."""
-    if len(block["lines"]) != 1 or _line_kind(block["lines"][0]):
+    if len(block["lines"]) != 1 or block["lines"][0][1]:
         return None
     if block["avg_size"] >= median_size * H2_FONT_FACTOR:
         return "heading2"
@@ -414,7 +417,7 @@ def extract_content(pdf_bytes, title="Presentazione"):
             # short but genuine slide title (e.g. "Analisi della stagione")
             # must survive when it's followed by real body content.
             filtered_body = [b for b in body_blocks if not _looks_like_cover_slide_label(b)]
-            if not filtered_body and slide_title and _looks_like_cover_slide_label({"lines": [slide_title]}):
+            if not filtered_body and slide_title and _looks_like_cover_slide_label({"lines": [(slide_title, None)]}):
                 slide_title = None
             body_blocks = filtered_body
 
@@ -428,11 +431,12 @@ def extract_content(pdf_bytes, title="Presentazione"):
         for b in body_blocks:
             subheading_kind = _classify_subheading(b, median_size)
             if subheading_kind:
-                text_norm = _normalize(b["lines"][0])
+                subheading_text = b["lines"][0][0]
+                text_norm = _normalize(subheading_text)
                 if text_norm in seen_in_section:
                     continue
                 seen_in_section.add(text_norm)
-                items.append({"kind": subheading_kind, "text": b["lines"][0]})
+                items.append({"kind": subheading_kind, "text": subheading_text})
                 continue
 
             for text, para_kind in _paragraphs_from_block(b):
