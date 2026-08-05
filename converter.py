@@ -57,16 +57,22 @@ def _convert_arrows(text):
     an ASCII arrow so it survives into plain Word text."""
     out = []
     for ch in text:
+        cp = ord(ch)
         try:
             name = unicodedata.name(ch)
         except ValueError:
+            name = None
+        if name and "ARROW" in name:
+            is_left = "LEFT" in name and "RIGHT" not in name
+            out.append("<--" if is_left else "-->")
+        elif 0xE000 <= cp <= 0xF8FF:
+            # Private-use-area glyph from a symbol font (Wingdings/Webdings)
+            # left unmapped by the PDF -- in slide decks these are almost
+            # always the arrow glyph used in "leads to" bullet phrasing, and
+            # otherwise they'd just render as a "?" box in Word.
+            out.append("-->")
+        else:
             out.append(ch)
-            continue
-        if "ARROW" not in name:
-            out.append(ch)
-            continue
-        is_left = "LEFT" in name and "RIGHT" not in name
-        out.append("<--" if is_left else "-->")
     return "".join(out)
 
 
@@ -338,6 +344,16 @@ def _detect_title(blocks, page_height):
     return None, blocks
 
 
+def _looks_like_cover_slide_label(block):
+    """Short, non-list fragments like 'Lesson', 'of', a lecture topic, or a
+    professor's name, typically laid out as separate boxes on a title
+    slide rather than real sentences."""
+    if _line_kind(block["lines"][0]):
+        return False
+    word_count = sum(len(line.split()) for line in block["lines"])
+    return len(block["lines"]) <= 2 and word_count <= 4
+
+
 def _classify_subheading(block, median_size):
     """A short, single-line block that is noticeably larger than normal body
     text (but isn't the slide title) is treated as a Heading 2/3."""
@@ -389,6 +405,19 @@ def extract_content(pdf_bytes, title="Presentazione"):
         images = _filter_images(pages_images[page_index], page_height, page_area, xref_freq, digest_freq)
 
         slide_title, body_blocks = _detect_title(blocks, page_height)
+
+        is_first_page = page_index == 0
+        if is_first_page:
+            # A cover slide's stray labels (lesson number, topic, professor
+            # name) aren't real content. Only drop the page's own "title"
+            # too when NOTHING real is left once those are removed -- a
+            # short but genuine slide title (e.g. "Analisi della stagione")
+            # must survive when it's followed by real body content.
+            filtered_body = [b for b in body_blocks if not _looks_like_cover_slide_label(b)]
+            if not filtered_body and slide_title and _looks_like_cover_slide_label({"lines": [slide_title]}):
+                slide_title = None
+            body_blocks = filtered_body
+
         title_norm = _normalize(slide_title) if slide_title else None
 
         if title_norm and title_norm != prev_title_norm:
@@ -423,7 +452,12 @@ def extract_content(pdf_bytes, title="Presentazione"):
                 continue
             bbox = info["bbox"]
             area_ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / page_area
-            if area_ratio >= LARGE_IMAGE_AREA_RATIO:
+            is_large = area_ratio >= LARGE_IMAGE_AREA_RATIO
+            if is_first_page and not is_large:
+                # Cover slides carry logos/decorative badges, not content;
+                # only a genuinely large graphic there is worth keeping.
+                continue
+            if is_large:
                 target_width, max_height = LARGE_IMAGE_WIDTH_IN, LARGE_IMAGE_MAX_HEIGHT_IN
             else:
                 target_width, max_height = SMALL_IMAGE_WIDTH_IN, SMALL_IMAGE_MAX_HEIGHT_IN
