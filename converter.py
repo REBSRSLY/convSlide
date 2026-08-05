@@ -2,6 +2,7 @@
 import io
 import re
 import statistics
+import unicodedata
 from collections import Counter
 
 import fitz  # PyMuPDF
@@ -14,12 +15,13 @@ from docx.shared import Inches, RGBColor
 
 BULLET_PREFIXES = ("•", "‣", "▪", "◦", "●", "○", "-", "*", "­", "‐")
 NUMBERED_RE = re.compile(r"^(\d+[.)]|[a-zA-Z][.)])\s+(.*)")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
-RIGHT_ARROW_CHARS = "→⇒➔➜➞➡⮕⟶⇾⤀"
-LEFT_ARROW_CHARS = "←⇐⬅⟵⇽"
-
-BLOCKLIST_KEYWORDS = ("politecnico", "motor system rehabilitation")
+BLOCKLIST_KEYWORDS = ("politecnico", "polimi", "motor system rehabilitation", "semester", "semestre")
 ACADEMIC_YEAR_RE = re.compile(r"\b\d{4}\s*/\s*\d{4}\b")
+DATE_RE = re.compile(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+SHORT_BLOCK_CHAR_LIMIT = 40  # only auto-drop date-only blocks, not real content that mentions a date
 
 MIN_IMAGE_DIM = 40  # px; skip tiny icons
 EDGE_BAND_RATIO = 0.08  # top/bottom 8% of the slide = header/footer band
@@ -51,11 +53,28 @@ STYLE_FOR_KIND = {"bullet": "List Bullet", "number": "List Number"}
 
 
 def _convert_arrows(text):
-    for ch in RIGHT_ARROW_CHARS:
-        text = text.replace(ch, "-->")
-    for ch in LEFT_ARROW_CHARS:
-        text = text.replace(ch, "<--")
-    return text
+    """Replace any Unicode arrow glyph (any direction, any arrow block) with
+    an ASCII arrow so it survives into plain Word text."""
+    out = []
+    for ch in text:
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            out.append(ch)
+            continue
+        if "ARROW" not in name:
+            out.append(ch)
+            continue
+        is_left = "LEFT" in name and "RIGHT" not in name
+        out.append("<--" if is_left else "-->")
+    return "".join(out)
+
+
+def _sanitize_text(text):
+    """Strip control characters that some fonts/PDF producers leave behind
+    for glyphs they can't map (e.g. a missing symbol -> NUL byte); those
+    would otherwise crash Word XML generation outright."""
+    return CONTROL_CHAR_RE.sub("", text)
 
 
 def _line_kind(text):
@@ -84,10 +103,15 @@ def _looks_like_page_number(lines):
 
 
 def _looks_like_institutional_noise(lines):
-    joined = " ".join(lines).lower()
-    if any(keyword in joined for keyword in BLOCKLIST_KEYWORDS):
+    joined = " ".join(lines)
+    lowered = joined.lower()
+    if any(keyword in lowered for keyword in BLOCKLIST_KEYWORDS):
         return True
-    return bool(ACADEMIC_YEAR_RE.search(joined))
+    if EMAIL_RE.search(joined):
+        return True
+    if len(joined) <= SHORT_BLOCK_CHAR_LIMIT and (ACADEMIC_YEAR_RE.search(joined) or DATE_RE.search(joined)):
+        return True
+    return False
 
 
 def _normalize(text):
@@ -185,7 +209,7 @@ def _extract_page_blocks(page):
         lines, sizes = [], []
         for line in b.get("lines", []):
             spans = line.get("spans", [])
-            line_text = _convert_arrows("".join(s.get("text", "") for s in spans).strip())
+            line_text = _sanitize_text(_convert_arrows("".join(s.get("text", "") for s in spans).strip()))
             if not line_text:
                 continue
             sizes.extend(s.get("size", 0) for s in spans)
@@ -260,7 +284,7 @@ def _collect_document_data(src):
     return pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size
 
 
-def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq):
+def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq, page_max_font):
     filtered = []
     for b in blocks:
         in_edge_band = (
@@ -270,7 +294,12 @@ def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq):
         is_small = b["avg_size"] <= small_font_threshold
         if in_edge_band and is_small:
             continue
-        if is_small and text_freq[_block_key(b)] >= 2:
+        # Anything that repeats verbatim across pages and isn't this page's
+        # own (largest-font) title is boilerplate: course name, professor,
+        # lesson/date labels, etc. Repetition is checked regardless of font
+        # size so it also catches boilerplate set in a normal body-text size.
+        is_title_candidate = b["avg_size"] >= page_max_font
+        if not is_title_candidate and text_freq[_block_key(b)] >= 2:
             continue
         filtered.append(b)
     return filtered
@@ -315,9 +344,9 @@ def _classify_subheading(block, median_size):
     if len(block["lines"]) != 1 or _line_kind(block["lines"][0]):
         return None
     if block["avg_size"] >= median_size * H2_FONT_FACTOR:
-        return "Heading 2"
+        return "heading2"
     if block["avg_size"] >= median_size * H3_FONT_FACTOR:
-        return "Heading 3"
+        return "heading3"
     return None
 
 
@@ -336,63 +365,53 @@ def _add_sized_picture(document, png_bytes, target_width_in, max_height_in):
     document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
-def pdf_to_docx(pdf_bytes, title="Presentazione"):
+def extract_content(pdf_bytes, title="Presentazione"):
+    """Parse the PDF into an ordered list of content items (title, headings,
+    paragraphs, images) independent of how the Word document gets built, so
+    the same extraction can feed both the original and a translated build."""
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size = (
         _collect_document_data(src)
     )
     small_font_threshold = median_size * SMALL_FONT_FACTOR
 
-    document = Document()
-    _apply_document_font(document)
-    _set_narrow_margins(document)
-    _add_centered_page_number_footer(document)
-
-    title_paragraph = document.add_heading(title, level=0)
-    _style_heading(title_paragraph, TITLE_SHADE_FILL, TITLE_FONT_COLOR)
-
+    items = [{"kind": "title", "text": title}]
     prev_title_norm = None
     seen_in_section = set()
 
     for page_index, page in enumerate(src):
         page_height = page.rect.height
         page_area = page.rect.width * page_height
+        raw_blocks = pages_blocks[page_index]
+        page_max_font = max((b["avg_size"] for b in raw_blocks), default=0)
 
-        blocks = _filter_text_blocks(pages_blocks[page_index], page_height, small_font_threshold, text_freq)
+        blocks = _filter_text_blocks(raw_blocks, page_height, small_font_threshold, text_freq, page_max_font)
         images = _filter_images(pages_images[page_index], page_height, page_area, xref_freq, digest_freq)
 
         slide_title, body_blocks = _detect_title(blocks, page_height)
         title_norm = _normalize(slide_title) if slide_title else None
 
         if title_norm and title_norm != prev_title_norm:
-            heading_paragraph = document.add_heading(slide_title, level=1)
-            _style_heading(heading_paragraph, H1_SHADE_FILL, H1_FONT_COLOR)
+            items.append({"kind": "heading1", "text": slide_title})
             prev_title_norm = title_norm
             seen_in_section = set()
 
         for b in body_blocks:
-            subheading_style = _classify_subheading(b, median_size)
-            if subheading_style:
-                text = _normalize(b["lines"][0])
-                if text in seen_in_section:
+            subheading_kind = _classify_subheading(b, median_size)
+            if subheading_kind:
+                text_norm = _normalize(b["lines"][0])
+                if text_norm in seen_in_section:
                     continue
-                seen_in_section.add(text)
-                heading_paragraph = document.add_heading(b["lines"][0], level=int(subheading_style[-1]))
-                if subheading_style == "Heading 2":
-                    _style_heading(heading_paragraph, H2_SHADE_FILL, H2_FONT_COLOR)
-                else:
-                    _style_heading(heading_paragraph, None, H3_FONT_COLOR)
+                seen_in_section.add(text_norm)
+                items.append({"kind": subheading_kind, "text": b["lines"][0]})
                 continue
 
-            for text, kind in _paragraphs_from_block(b):
+            for text, para_kind in _paragraphs_from_block(b):
                 norm = _normalize(text)
                 if norm in seen_in_section:
                     continue
                 seen_in_section.add(norm)
-                style = STYLE_FOR_KIND.get(kind)
-                paragraph = document.add_paragraph(text, style=style)
-                for run in paragraph.runs:
-                    _set_run_font(run)
+                items.append({"kind": "paragraph", "text": text, "list_style": para_kind})
 
         for info in images:
             try:
@@ -408,11 +427,94 @@ def pdf_to_docx(pdf_bytes, title="Presentazione"):
                 target_width, max_height = LARGE_IMAGE_WIDTH_IN, LARGE_IMAGE_MAX_HEIGHT_IN
             else:
                 target_width, max_height = SMALL_IMAGE_WIDTH_IN, SMALL_IMAGE_MAX_HEIGHT_IN
+            items.append({
+                "kind": "image",
+                "png_bytes": png_bytes,
+                "target_width": target_width,
+                "max_height": max_height,
+            })
+
+    return items
+
+
+_HEADING_STYLE = {
+    "title": (0, TITLE_SHADE_FILL, TITLE_FONT_COLOR),
+    "heading1": (1, H1_SHADE_FILL, H1_FONT_COLOR),
+    "heading2": (2, H2_SHADE_FILL, H2_FONT_COLOR),
+    "heading3": (3, None, H3_FONT_COLOR),
+}
+
+
+def build_document(items):
+    """Render a list of content items (see extract_content) into a styled
+    Word document and return its bytes."""
+    document = Document()
+    _apply_document_font(document)
+    _set_narrow_margins(document)
+    _add_centered_page_number_footer(document)
+
+    for item in items:
+        kind = item["kind"]
+        if kind in _HEADING_STYLE:
+            level, fill_hex, font_hex = _HEADING_STYLE[kind]
+            paragraph = document.add_heading(item["text"], level=level)
+            _style_heading(paragraph, fill_hex, font_hex)
+        elif kind == "paragraph":
+            style = STYLE_FOR_KIND.get(item.get("list_style"))
+            paragraph = document.add_paragraph(item["text"], style=style)
+            for run in paragraph.runs:
+                _set_run_font(run)
+        elif kind == "image":
             try:
-                _add_sized_picture(document, png_bytes, target_width, max_height)
+                _add_sized_picture(document, item["png_bytes"], item["target_width"], item["max_height"])
             except Exception:
                 continue
 
     out = io.BytesIO()
     document.save(out)
     return out.getvalue()
+
+
+def translate_items(items, target_lang="it"):
+    """Return a copy of items with every text field translated; falls back
+    to the original text for anything that can't be translated (e.g. no
+    network access), so a translation hiccup never breaks the conversion."""
+    from deep_translator import GoogleTranslator
+
+    translator = GoogleTranslator(source="auto", target=target_lang)
+    text_indices = [i for i, item in enumerate(items) if item["kind"] != "image" and item["text"].strip()]
+    texts = [items[i]["text"] for i in text_indices]
+
+    new_items = [dict(item) for item in items]
+    if not texts:
+        return new_items
+
+    translated = None
+    try:
+        translated = translator.translate_batch(texts)
+    except Exception:
+        translated = None
+
+    if translated and len(translated) == len(texts):
+        for idx, translated_text in zip(text_indices, translated):
+            if translated_text:
+                new_items[idx]["text"] = translated_text
+    else:
+        for idx in text_indices:
+            try:
+                result = translator.translate(new_items[idx]["text"])
+                if result:
+                    new_items[idx]["text"] = result
+            except Exception:
+                continue
+
+    return new_items
+
+
+def pdf_to_docx(pdf_bytes, title="Presentazione"):
+    return build_document(extract_content(pdf_bytes, title))
+
+
+def pdf_to_docx_italian(pdf_bytes, title="Presentazione"):
+    items = extract_content(pdf_bytes, title)
+    return build_document(translate_items(items, target_lang="it"))
