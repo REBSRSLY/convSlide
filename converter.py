@@ -213,6 +213,52 @@ def _add_centered_page_number_footer(document):
         run._r.append(fld_end)
 
 
+def _find_list_number_abstract_id(document):
+    """Find the abstractNumId backing the built-in "List Number" style, so a
+    fresh numbering instance can be created against the same format."""
+    numbering_el = document.part.numbering_part.element
+    for abstract_num in numbering_el.findall(qn("w:abstractNum")):
+        for lvl in abstract_num.findall(qn("w:lvl")):
+            p_style = lvl.find(qn("w:pStyle"))
+            if p_style is not None and p_style.get(qn("w:val")) == "ListNumber":
+                return abstract_num.get(qn("w:abstractNumId"))
+    return None
+
+
+def _new_numbering_instance(document, abstract_num_id):
+    """Add a new <w:num> instance referencing the given abstract numbering
+    definition and return its numId. Each list gets its own instance so
+    Word restarts counting at 1 instead of continuing a shared counter
+    across every numbered list in the document."""
+    numbering_el = document.part.numbering_part.element
+    existing_ids = [int(n.get(qn("w:numId"))) for n in numbering_el.findall(qn("w:num"))]
+    new_id = max(existing_ids, default=0) + 1
+    num_el = OxmlElement("w:num")
+    num_el.set(qn("w:numId"), str(new_id))
+    abstract_ref = OxmlElement("w:abstractNumId")
+    abstract_ref.set(qn("w:val"), str(abstract_num_id))
+    num_el.append(abstract_ref)
+    numbering_el.append(num_el)
+    return new_id
+
+
+def _set_paragraph_num_id(paragraph, num_id):
+    pPr = paragraph._p.get_or_add_pPr()
+    numPr = pPr.find(qn("w:numPr"))
+    if numPr is None:
+        numPr = OxmlElement("w:numPr")
+        pPr.insert(0, numPr)
+    else:
+        for child in list(numPr):
+            numPr.remove(child)
+    ilvl = OxmlElement("w:ilvl")
+    ilvl.set(qn("w:val"), "0")
+    num_id_el = OxmlElement("w:numId")
+    num_id_el.set(qn("w:val"), str(num_id))
+    numPr.append(ilvl)
+    numPr.append(num_id_el)
+
+
 def _extract_page_blocks(page):
     raw = page.get_text("dict")
     blocks = []
@@ -554,32 +600,71 @@ def build_document(items):
     _set_narrow_margins(document)
     _add_centered_page_number_footer(document)
 
+    list_number_abstract_id = _find_list_number_abstract_id(document)
+    current_number_list_id = None
+
     for item in items:
         kind = item["kind"]
         if kind in _HEADING_STYLE:
             level, fill_hex, font_hex = _HEADING_STYLE[kind]
             paragraph = document.add_heading(item["text"], level=level)
             _style_heading(paragraph, fill_hex, font_hex)
+            current_number_list_id = None
         elif kind == "paragraph":
-            style = STYLE_FOR_KIND.get(item.get("list_style"))
+            list_style = item.get("list_style")
+            style = STYLE_FOR_KIND.get(list_style)
             paragraph = document.add_paragraph(item["text"], style=style)
             for run in paragraph.runs:
                 _set_run_font(run)
+            if list_style == "number":
+                if current_number_list_id is None and list_number_abstract_id is not None:
+                    current_number_list_id = _new_numbering_instance(document, list_number_abstract_id)
+                if current_number_list_id is not None:
+                    _set_paragraph_num_id(paragraph, current_number_list_id)
+            else:
+                current_number_list_id = None
         elif kind == "image":
             try:
                 _add_sized_picture(document, item["png_bytes"], item["target_width"], item["max_height"])
             except Exception:
                 continue
+            current_number_list_id = None
 
     out = io.BytesIO()
     document.save(out)
     return out.getvalue()
 
 
+TRANSLATION_ERROR_MARKERS = (
+    "error 500",
+    "server error",
+    "that's an error",
+    "that’s an error",
+    "that's all we know",
+    "that’s all we know",
+)
+TRANSLATION_CHUNK_SIZE = 25
+TRANSLATION_CHUNK_DELAY_SEC = 1.0
+TRANSLATION_ITEM_DELAY_SEC = 0.3
+
+
+def _is_valid_translation(result):
+    if not result or not result.strip():
+        return False
+    lowered = result.lower()
+    return not any(marker in lowered for marker in TRANSLATION_ERROR_MARKERS)
+
+
 def translate_items(items, target_lang="it"):
     """Return a copy of items with every text field translated; falls back
-    to the original text for anything that can't be translated (e.g. no
-    network access), so a translation hiccup never breaks the conversion."""
+    to the original text for anything that can't be translated. The free
+    Google Translate endpoint occasionally returns its own HTML error page
+    body as if it were a translation (no exception raised) when it's rate
+    limited, so every result is validated before being accepted -- a
+    rejected/failed item just keeps its original text rather than being
+    replaced with garbage."""
+    import time
+
     from deep_translator import GoogleTranslator
 
     translator = GoogleTranslator(source="auto", target=target_lang)
@@ -590,24 +675,36 @@ def translate_items(items, target_lang="it"):
     if not texts:
         return new_items
 
-    translated = None
-    try:
-        translated = translator.translate_batch(texts)
-    except Exception:
-        translated = None
+    for chunk_start in range(0, len(texts), TRANSLATION_CHUNK_SIZE):
+        chunk_indices = text_indices[chunk_start:chunk_start + TRANSLATION_CHUNK_SIZE]
+        chunk_texts = texts[chunk_start:chunk_start + TRANSLATION_CHUNK_SIZE]
 
-    if translated and len(translated) == len(texts):
-        for idx, translated_text in zip(text_indices, translated):
-            if translated_text:
+        translated = None
+        try:
+            translated = translator.translate_batch(chunk_texts)
+        except Exception:
+            translated = None
+
+        if (
+            translated
+            and len(translated) == len(chunk_texts)
+            and all(_is_valid_translation(t) for t in translated)
+        ):
+            for idx, translated_text in zip(chunk_indices, translated):
                 new_items[idx]["text"] = translated_text
-    else:
-        for idx in text_indices:
-            try:
-                result = translator.translate(new_items[idx]["text"])
-                if result:
+        else:
+            # Batch failed or looked corrupted -- retry this chunk one item
+            # at a time, validating each and keeping the original on failure.
+            for idx in chunk_indices:
+                try:
+                    result = translator.translate(new_items[idx]["text"])
+                except Exception:
+                    result = None
+                if _is_valid_translation(result):
                     new_items[idx]["text"] = result
-            except Exception:
-                continue
+                time.sleep(TRANSLATION_ITEM_DELAY_SEC)
+
+        time.sleep(TRANSLATION_CHUNK_DELAY_SEC)
 
     return new_items
 
