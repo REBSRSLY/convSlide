@@ -14,8 +14,13 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, RGBColor
 
 BULLET_PREFIXES = ("•", "‣", "▪", "◦", "●", "○", "-", "*", "­", "‐")
-NUMBERED_RE = re.compile(r"^(\d+[.)]|[a-zA-Z][.)])\s+(.*)")
+# The trailing text is optional: a numbered marker sometimes sits alone on
+# its own PDF text line, with the item's actual text on the following line(s).
+NUMBERED_RE = re.compile(r"^(\d+[.)]|[a-zA-Z][.)])(?:\s+(.*))?$")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+MAX_LABEL_IMAGE_HEIGHT_PX = 200  # candidate height for a "text rendered as an image" label
+MAX_LABEL_IMAGE_COLORS = 300  # real photos/diagrams have far more distinct colors than a flat text badge
 
 BLOCKLIST_KEYWORDS = ("politecnico", "polimi", "motor system rehabilitation", "semester", "semestre")
 ACADEMIC_YEAR_RE = re.compile(r"\b\d{4}\s*/\s*\d{4}\b")
@@ -100,7 +105,7 @@ def _classify_line_marker(raw_text):
         return "bullet", stripped[1:].strip()
     m = NUMBERED_RE.match(stripped)
     if m:
-        return "number", m.group(2)
+        return "number", (m.group(2) or "").strip()
     if _arrow_replacement(stripped[0]) is not None:
         return "bullet", stripped[1:].strip()
     return None, stripped
@@ -214,13 +219,14 @@ def _extract_page_blocks(page):
     for b in raw.get("blocks", []):
         if b.get("type") != 0:  # 0 = text block
             continue
-        lines, sizes = [], []
+        lines, sizes, fonts = [], [], []
         for line in b.get("lines", []):
             spans = line.get("spans", [])
             raw_text = _sanitize_text("".join(s.get("text", "") for s in spans).strip())
             if not raw_text:
                 continue
             sizes.extend(s.get("size", 0) for s in spans)
+            fonts.extend(s.get("font", "") for s in spans)
             kind, remainder = _classify_line_marker(raw_text)
             lines.append((_convert_arrows(remainder), kind))
         plain_lines = [text for text, _kind in lines]
@@ -230,22 +236,30 @@ def _extract_page_blocks(page):
             "bbox": b["bbox"],
             "lines": lines,
             "avg_size": sum(sizes) / len(sizes) if sizes else 0,
+            "all_bold": bool(fonts) and all("bold" in f.lower() for f in fonts),
         })
     blocks.sort(key=lambda blk: (round(blk["bbox"][1], 0), blk["bbox"][0]))
     return blocks
 
 
-def _paragraphs_from_block(block):
-    """Merge wrapped lines into paragraphs, splitting on new bullet/number markers."""
+def _merge_lines_into_paragraphs(lines):
+    """Merge a flat stream of (text, kind) lines into paragraphs, splitting on
+    new bullet/number markers. Takes a plain line list rather than a single
+    block's lines because PDF exporters sometimes split one bulleted
+    sentence's wrapped continuation into a separate text block -- feeding in
+    lines flattened across those block boundaries keeps such sentences whole."""
     paragraphs = []
     current_text, current_kind = None, None
-    for text, kind in block["lines"]:
+    for text, kind in lines:
         if kind:
             if current_text:
                 paragraphs.append((current_text, current_kind))
             current_text, current_kind = text, kind
-        elif current_text is None:
-            current_text, current_kind = text, None
+        elif not current_text:
+            # Nothing accumulated yet (or just an empty marker, e.g. a bullet
+            # glyph on its own line) -- adopt this text but keep any kind
+            # already established by that marker.
+            current_text = text
         else:
             current_text += " " + text
     if current_text:
@@ -263,6 +277,21 @@ def _to_png_bytes(image_bytes):
         return out.getvalue()
     except Exception:
         return None
+
+
+def _looks_like_text_label_image(png_bytes):
+    """Detect a short, near-flat-color image that's really a stylized text
+    caption exported as a picture (e.g. WordArt-style headings/percentages
+    rendered as a bitmap) rather than a real photo/diagram. Real diagrams
+    have far more distinct colors even when small."""
+    try:
+        with Image.open(io.BytesIO(png_bytes)) as im:
+            if im.height > MAX_LABEL_IMAGE_HEIGHT_PX:
+                return False
+            colors = im.convert("RGB").getcolors(maxcolors=MAX_LABEL_IMAGE_COLORS)
+        return colors is not None
+    except Exception:
+        return False
 
 
 def _collect_document_data(src):
@@ -359,12 +388,17 @@ def _looks_like_cover_slide_label(block):
 
 def _classify_subheading(block, median_size):
     """A short, single-line block that is noticeably larger than normal body
-    text (but isn't the slide title) is treated as a Heading 2/3."""
+    text (but isn't the slide title) is treated as a Heading 2/3. A short,
+    entirely bold line at ordinary body size (e.g. "Pros"/"Cons",
+    "Advantages") is also a sub-header even without a size difference."""
     if len(block["lines"]) != 1 or block["lines"][0][1]:
         return None
+    text = block["lines"][0][0]
     if block["avg_size"] >= median_size * H2_FONT_FACTOR:
         return "heading2"
     if block["avg_size"] >= median_size * H3_FONT_FACTOR:
+        return "heading3"
+    if block.get("all_bold") and len(text.split()) <= 4:
         return "heading3"
     return None
 
@@ -428,23 +462,50 @@ def extract_content(pdf_bytes, title="Presentazione"):
             prev_title_norm = title_norm
             seen_in_section = set()
 
+        pending_text, pending_kind = None, None
+
+        def _flush_pending():
+            nonlocal pending_text, pending_kind
+            if pending_text:
+                norm = _normalize(pending_text)
+                if norm not in seen_in_section:
+                    seen_in_section.add(norm)
+                    items.append({"kind": "paragraph", "text": pending_text, "list_style": pending_kind})
+            pending_text, pending_kind = None, None
+
         for b in body_blocks:
             subheading_kind = _classify_subheading(b, median_size)
             if subheading_kind:
+                _flush_pending()
                 subheading_text = b["lines"][0][0]
                 text_norm = _normalize(subheading_text)
-                if text_norm in seen_in_section:
-                    continue
-                seen_in_section.add(text_norm)
-                items.append({"kind": subheading_kind, "text": subheading_text})
+                if text_norm not in seen_in_section:
+                    seen_in_section.add(text_norm)
+                    items.append({"kind": subheading_kind, "text": subheading_text})
                 continue
 
-            for text, para_kind in _paragraphs_from_block(b):
-                norm = _normalize(text)
-                if norm in seen_in_section:
-                    continue
-                seen_in_section.add(norm)
-                items.append({"kind": "paragraph", "text": text, "list_style": para_kind})
+            block_paragraphs = _merge_lines_into_paragraphs(b["lines"])
+            if not block_paragraphs:
+                continue
+
+            first_text, first_kind = block_paragraphs[0]
+            rest = block_paragraphs[1:]
+            # A bulleted/numbered sentence's wrapped continuation sometimes
+            # lands in a separate PDF text block from its own marker (no
+            # marker of its own). Only bridge that gap when the still-open
+            # item actually had a marker -- two adjacent PLAIN blocks (e.g.
+            # independent diagram captions/labels) must stay separate.
+            if pending_text is not None and pending_kind and not first_kind:
+                pending_text += " " + first_text
+            else:
+                _flush_pending()
+                pending_text, pending_kind = first_text, first_kind
+
+            for text, kind in rest:
+                _flush_pending()
+                pending_text, pending_kind = text, kind
+
+        _flush_pending()
 
         for info in images:
             try:
@@ -453,6 +514,8 @@ def extract_content(pdf_bytes, title="Presentazione"):
                 continue
             png_bytes = _to_png_bytes(base["image"])
             if not png_bytes:
+                continue
+            if _looks_like_text_label_image(png_bytes):
                 continue
             bbox = info["bbox"]
             area_ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / page_area
