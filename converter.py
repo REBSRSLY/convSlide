@@ -29,6 +29,8 @@ EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 SHORT_BLOCK_CHAR_LIMIT = 40  # only auto-drop date-only blocks, not real content that mentions a date
 
 MIN_IMAGE_DIM = 40  # px; skip tiny icons
+IMAGE_REPEAT_FRACTION = 0.25  # fraction of the deck's pages an image must recur on to count as a logo
+MIN_IMAGE_REPEAT_COUNT = 2  # floor for very short decks
 EDGE_BAND_RATIO = 0.08  # top/bottom 8% of the slide = header/footer band
 SMALL_FONT_FACTOR = 0.65  # relative to median body font size, for footer detection
 H2_FONT_FACTOR = 1.35  # relative to median body font size, for sub-heading detection
@@ -39,6 +41,17 @@ LARGE_IMAGE_WIDTH_IN = 6.0
 LARGE_IMAGE_MAX_HEIGHT_IN = 3.0
 SMALL_IMAGE_WIDTH_IN = 2.0
 SMALL_IMAGE_MAX_HEIGHT_IN = 1.5
+
+# Slide decks often draw arrows/circles/labels as separate vector shapes on
+# top of (or around) a pasted picture -- extracting just the embedded raster
+# loses that annotation. These control how "real" annotation shapes are told
+# apart from a template's repeated background decoration, and how nearby
+# shapes/images get grouped into one rendered snapshot of the whole graphic.
+DRAWING_TEMPLATE_FREQUENCY_RATIO = 0.8  # a shape at the same spot on >=80% of pages is template decor
+DRAWING_BACKGROUND_AREA_RATIO = 0.5  # a shape covering more than half the slide is a background fill
+CLUSTER_MERGE_MARGIN_PT = 20  # merge shapes/images within this many points of each other
+MIN_DRAWING_ONLY_CLUSTER_AREA_RATIO = 0.01  # ignore stray single-line clusters with no picture at all
+GRAPHIC_RENDER_ZOOM = 2.0  # supersampling factor when rasterizing a clipped slide region
 
 DOCUMENT_FONT = "Aptos"
 NARROW_MARGIN_IN = 0.5
@@ -313,26 +326,14 @@ def _merge_lines_into_paragraphs(lines):
     return paragraphs
 
 
-def _to_png_bytes(image_bytes):
-    try:
-        im = Image.open(io.BytesIO(image_bytes))
-        if im.mode in ("CMYK", "P", "LA"):
-            im = im.convert("RGB")
-        out = io.BytesIO()
-        im.save(out, format="PNG")
-        return out.getvalue()
-    except Exception:
-        return None
-
-
-def _looks_like_text_label_image(png_bytes):
+def _looks_like_text_label_image(png_bytes, max_height_px=MAX_LABEL_IMAGE_HEIGHT_PX):
     """Detect a short, near-flat-color image that's really a stylized text
     caption exported as a picture (e.g. WordArt-style headings/percentages
     rendered as a bitmap) rather than a real photo/diagram. Real diagrams
     have far more distinct colors even when small."""
     try:
         with Image.open(io.BytesIO(png_bytes)) as im:
-            if im.height > MAX_LABEL_IMAGE_HEIGHT_PX:
+            if im.height > max_height_px:
                 return False
             colors = im.convert("RGB").getcolors(maxcolors=MAX_LABEL_IMAGE_COLORS)
         return colors is not None
@@ -340,13 +341,20 @@ def _looks_like_text_label_image(png_bytes):
         return False
 
 
+def _drawing_signature(d):
+    r = d["rect"]
+    return (d.get("type"), round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+
+
 def _collect_document_data(src):
-    """First pass: gather every page's text blocks and image placements so
-    recurring headers/footers/logos can be recognized across the whole deck."""
-    pages_blocks, pages_images = [], []
+    """First pass: gather every page's text blocks, image placements, and
+    vector-drawing shapes so recurring headers/footers/logos/background
+    decoration can be recognized across the whole deck."""
+    pages_blocks, pages_images, pages_drawings = [], [], []
     text_freq = Counter()
     xref_freq = Counter()
     digest_freq = Counter()
+    drawing_freq = Counter()
     all_sizes = []
 
     for page in src:
@@ -364,8 +372,25 @@ def _collect_document_data(src):
             if info.get("digest"):
                 digest_freq[info["digest"]] += 1
 
+        drawings = page.get_drawings()
+        pages_drawings.append(drawings)
+        for d in drawings:
+            drawing_freq[_drawing_signature(d)] += 1
+
     median_size = statistics.median(all_sizes) if all_sizes else 12
-    return pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size
+    template_drawing_sigs = {
+        s for s, c in drawing_freq.items() if c >= DRAWING_TEMPLATE_FREQUENCY_RATIO * len(src)
+    }
+    return (
+        pages_blocks,
+        pages_images,
+        pages_drawings,
+        text_freq,
+        xref_freq,
+        digest_freq,
+        median_size,
+        template_drawing_sigs,
+    )
 
 
 def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq, page_max_font):
@@ -389,7 +414,7 @@ def _filter_text_blocks(blocks, page_height, small_font_threshold, text_freq, pa
     return filtered
 
 
-def _filter_images(images, page_height, page_area, xref_freq, digest_freq):
+def _filter_images(images, page_height, page_area, xref_freq, digest_freq, repeat_threshold):
     filtered = []
     for info in images:
         if info.get("width", 0) < MIN_IMAGE_DIM or info.get("height", 0) < MIN_IMAGE_DIM:
@@ -402,12 +427,90 @@ def _filter_images(images, page_height, page_area, xref_freq, digest_freq):
         fully_in_bottom_band = bbox[1] >= page_height * (1 - EDGE_BAND_RATIO)
         if fully_in_top_band or fully_in_bottom_band:
             continue
-        if info.get("xref") and xref_freq[info["xref"]] >= 2:
+        # A logo repeats on nearly every page; a reference diagram the
+        # lecturer reuses across a handful of slides is legitimate content,
+        # not decoration, so only the former should be filtered out.
+        if info.get("xref") and xref_freq[info["xref"]] >= repeat_threshold:
             continue
-        if info.get("digest") and digest_freq[info["digest"]] >= 2:
+        if info.get("digest") and digest_freq[info["digest"]] >= repeat_threshold:
             continue
         filtered.append(info)
     return filtered
+
+
+def _page_annotation_rects(drawings, template_drawing_sigs, page_area):
+    """Vector shapes drawn directly on the slide (arrows, circles, callout
+    lines) that aren't part of the template's repeated background decor."""
+    rects = []
+    for d in drawings:
+        if _drawing_signature(d) in template_drawing_sigs:
+            continue
+        r = d["rect"]
+        if r.width <= 0 or r.height <= 0:
+            continue
+        if r.width * r.height >= DRAWING_BACKGROUND_AREA_RATIO * page_area:
+            continue
+        rects.append(fitz.Rect(r))
+    return rects
+
+
+def _cluster_rects(items, margin):
+    """Group (rect, label) entries whose boxes overlap or sit within `margin`
+    points of each other, so a pasted picture and the arrows/circles drawn
+    around it become one combined region. Returns a list of
+    {"rect": combined_rect, "labels": set(...)}."""
+    n = len(items)
+    if n == 0:
+        return []
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    changed = True
+    while changed:
+        changed = False
+        roots = {}
+        for i in range(n):
+            root = find(i)
+            if root not in roots:
+                roots[root] = fitz.Rect(items[i][0])
+            else:
+                roots[root] |= items[i][0]
+        root_ids = list(roots.keys())
+        for a in range(len(root_ids)):
+            for b in range(a + 1, len(root_ids)):
+                if find(root_ids[a]) == find(root_ids[b]):
+                    continue
+                rect_a, rect_b = roots[root_ids[a]], roots[root_ids[b]]
+                expanded = fitz.Rect(rect_a.x0 - margin, rect_a.y0 - margin, rect_a.x1 + margin, rect_a.y1 + margin)
+                if expanded.intersects(rect_b):
+                    union(root_ids[a], root_ids[b])
+                    changed = True
+
+    clusters = {}
+    for i in range(n):
+        root = find(i)
+        if root not in clusters:
+            clusters[root] = {"rect": fitz.Rect(items[i][0]), "labels": set()}
+        else:
+            clusters[root]["rect"] |= items[i][0]
+        clusters[root]["labels"].add(items[i][1])
+    return list(clusters.values())
+
+
+def _render_clip_png(page, rect, zoom=GRAPHIC_RENDER_ZOOM):
+    matrix = fitz.Matrix(zoom, zoom)
+    pixmap = page.get_pixmap(clip=rect, matrix=matrix)
+    return pixmap.tobytes("png")
 
 
 def _detect_title(blocks, page_height):
@@ -469,14 +572,22 @@ def extract_content(pdf_bytes, title="Presentazione"):
     paragraphs, images) independent of how the Word document gets built, so
     the same extraction can feed both the original and a translated build."""
     src = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_blocks, pages_images, text_freq, xref_freq, digest_freq, median_size = (
-        _collect_document_data(src)
-    )
+    (
+        pages_blocks,
+        pages_images,
+        pages_drawings,
+        text_freq,
+        xref_freq,
+        digest_freq,
+        median_size,
+        template_drawing_sigs,
+    ) = _collect_document_data(src)
     small_font_threshold = median_size * SMALL_FONT_FACTOR
 
     items = [{"kind": "title", "text": title}]
     prev_title_norm = None
     seen_in_section = set()
+    image_repeat_threshold = max(MIN_IMAGE_REPEAT_COUNT, IMAGE_REPEAT_FRACTION * len(src))
 
     for page_index, page in enumerate(src):
         page_height = page.rect.height
@@ -485,7 +596,9 @@ def extract_content(pdf_bytes, title="Presentazione"):
         page_max_font = max((b["avg_size"] for b in raw_blocks), default=0)
 
         blocks = _filter_text_blocks(raw_blocks, page_height, small_font_threshold, text_freq, page_max_font)
-        images = _filter_images(pages_images[page_index], page_height, page_area, xref_freq, digest_freq)
+        images = _filter_images(
+            pages_images[page_index], page_height, page_area, xref_freq, digest_freq, image_repeat_threshold
+        )
 
         slide_title, body_blocks = _detect_title(blocks, page_height)
 
@@ -553,18 +666,38 @@ def extract_content(pdf_bytes, title="Presentazione"):
 
         _flush_pending()
 
-        for info in images:
+        # A pasted picture's arrows/circles/callout labels are often drawn as
+        # separate vector shapes on top of or around it, not baked into the
+        # raster -- cluster each image with any nearby annotation shapes and
+        # render the WHOLE region together so nothing gets lost.
+        annotation_rects = _page_annotation_rects(pages_drawings[page_index], template_drawing_sigs, page_area)
+        cluster_items = [(fitz.Rect(info["bbox"]), "image") for info in images]
+        cluster_items += [(r, "drawing") for r in annotation_rects]
+        clusters = _cluster_rects(cluster_items, CLUSTER_MERGE_MARGIN_PT)
+
+        for cluster in clusters:
+            rect = cluster["rect"]
+            has_image = "image" in cluster["labels"]
+            has_annotation = "drawing" in cluster["labels"]
+            area_ratio = (rect.width * rect.height) / page_area
+
+            if not has_image and area_ratio < MIN_DRAWING_ONLY_CLUSTER_AREA_RATIO:
+                # Pure vector shapes with no picture and too small to be a
+                # real diagram (e.g. a single stray line) -- skip.
+                continue
+
             try:
-                base = src.extract_image(info["xref"])
+                png_bytes = _render_clip_png(page, rect)
             except Exception:
                 continue
-            png_bytes = _to_png_bytes(base["image"])
-            if not png_bytes:
-                continue
-            if _looks_like_text_label_image(png_bytes):
-                continue
-            bbox = info["bbox"]
-            area_ratio = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / page_area
+
+            if has_image and not has_annotation:
+                # Behaves like a single plain picture (nothing merged in) --
+                # the WordArt-style flat-label filter still applies.
+                label_height_threshold = MAX_LABEL_IMAGE_HEIGHT_PX * GRAPHIC_RENDER_ZOOM
+                if _looks_like_text_label_image(png_bytes, label_height_threshold):
+                    continue
+
             is_large = area_ratio >= LARGE_IMAGE_AREA_RATIO
             if is_first_page and not is_large:
                 # Cover slides carry logos/decorative badges, not content;
